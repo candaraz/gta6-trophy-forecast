@@ -53,16 +53,18 @@ LAUNCH_HISTORY_PLAYERS = 638
 LAUNCH_HISTORY_EARNED = 943
 LAUNCH_MAX_HORIZON_MINUTES = 240
 
-# Tier priors for how fast a trophy's holder count follows the player base.
-# A bronze that almost nobody new earns sits near 0; a platinum everybody
-# owns rides the player base almost one-for-one.
-TIER_GAMMA_POOL = {
-    "bronze": 0.14,
-    "gold": 0.07,
-    "silver": 0.0,
-    "platinum": 0.0,
+# Tier priors for how a trophy's rarity answers the player base.
+# The fit is `log(rate) = alpha + beta * log(N)`, so `beta` says how the
+# rarity moves when the base grows: `beta = -1` is a trophy whose holders
+# never grow (its rate falls exactly as `1 / N`), `beta = 0` is one whose
+# holders keep up with the base (its rate holds).
+TIER_BETA_POOL = {
+    "bronze": -0.85,
+    "gold": -0.93,
+    "silver": -1.0,
+    "platinum": -1.0,
 }
-DEFAULT_GAMMA_POOL = 0.10
+DEFAULT_BETA_POOL = -0.90
 
 # z-scores of the five requested levels (0.05, 0.25, 0.5, 0.75, 0.95).
 Z_LEVELS = (-1.645, -0.674, 0.0, 0.674, 1.645)
@@ -369,47 +371,56 @@ def player_base(case: dict, states):
 
 
 def trophy_fit(states, index: int):
-    """Regress a trophy's holder count against the player base.
+    """Regress a trophy's earn rate against the player base.
 
-    Returns `(alpha, gamma, count_samples, residual_scatter, last_count)`.
+    The relation is a straight line in log-log space:
+    `log(rate) = alpha + beta * log(N)`.  `beta` says how the rarity answers
+    the base: `beta = -1` is a trophy whose holders never grow (its rate
+    falls exactly as `1/N`), `beta = 0` is one whose holders keep up with the
+    base (its rate holds).
+
+    The fit is in rate space, not count space, because the step from one
+    holder count to the next is `100 / N` percentage points: once the base
+    reaches tens of thousands of players, a printed rate stands for three or
+    four different counts, so a count recovered from a rate there is noise,
+    while the rate itself is exactly what the page printed.
+
+    Returns `(alpha, beta, samples, residual_scatter, last_rate)`.
     """
     samples = []
     for state in states:
         if index >= len(state.rates):
             continue
         rate = state.rates[index]
-        if rate is None:
+        if rate is None or rate <= 0.0:
             continue
-        count = count_of(rate, state.players)
-        if count is None or count <= 0:
-            continue
-        samples.append((state.players, count))
+        samples.append((state.players, float(rate)))
 
-    last_count = None
+    last_rate = None
     for state in reversed(states):
         if index < len(state.rates) and state.rates[index] is not None:
-            last_count = count_of(state.rates[index], state.players)
+            last_rate = float(state.rates[index])
             break
 
     if len(samples) >= 2:
         xs = [math.log(n) for n, _ in samples]
-        ys = [math.log(k) for _, k in samples]
+        ys = [math.log(r) for _, r in samples]
         a, b, residuals = least_squares(xs, ys)
         if a is not None:
-            return a, b, samples, scatter(residuals), last_count
-    return None, None, samples, 0.0, last_count
+            return a, b, samples, scatter(residuals), last_rate
+    return None, None, samples, 0.0, last_rate
 
-def shrink_gamma(gamma, pool, n_states: int) -> float:
-    """Shrink a fitted gamma toward the tier's pooled value.
+def shrink_beta(beta, pool, n_states: int) -> float:
+    """Shrink a fitted beta toward the tier's pooled value.
 
     The pool counts as a single extra observation, so a fit built from many
     states keeps most of its own signal while a fit from one or two states
     falls back on the tier prior.
     """
-    if gamma is None:
-        return clamp(pool, 0.0, 1.0)
-    blended = (n_states * gamma + pool) / (n_states + 1.0)
-    return clamp(blended, 0.0, 1.0)
+    if beta is None:
+        return clamp(pool, -1.0, 0.0)
+    blended = (n_states * beta + pool) / (n_states + 1.0)
+    return clamp(blended, -1.0, 0.0)
 
 
 def forecast_trophies(case: dict):
@@ -417,6 +428,7 @@ def forecast_trophies(case: dict):
     states = collect_states(case)
     base = player_base(case, states)
     n_target = base["n_target"] if base else 1.0
+    n_last = float(states[-1].players) if states else 1.0
     step = base["step"] if base else 0.0
     base_scatter = base["residual_scatter"] if base else 0.0
 
@@ -431,9 +443,9 @@ def forecast_trophies(case: dict):
     rows = []
     for index, trophy_id in enumerate(case["_trophy_ids"]):
         tier = case["_tiers"][index] if index < len(case["_tiers"]) else ""
-        pool = TIER_GAMMA_POOL.get(tier, DEFAULT_GAMMA_POOL)
+        pool = TIER_BETA_POOL.get(tier, DEFAULT_BETA_POOL)
 
-        alpha, gamma, samples, resid_scatter, last_count = trophy_fit(states, index)
+        alpha, beta, samples, resid_scatter, last_rate = trophy_fit(states, index)
 
         # Does every tracked player hold this trophy?
         everyone = False
@@ -443,29 +455,33 @@ def forecast_trophies(case: dict):
                 break
 
         if everyone:
-            # Its count is the tracked-player count, so its rate stays at 100.
+            # Every tracked player has it, so its rate stays at 100.
             median = 99.99
             width = 0.5
             rows.append({"id": trophy_id, "q": quantile_row(median, width)})
             continue
 
         n_states = len(samples)
-        gamma = shrink_gamma(gamma, pool, n_states)
+        beta = shrink_beta(beta, pool, n_states)
 
-        if alpha is None:
-            # Too few states to fit: hold the count where it is.
-            count = last_count if last_count is not None else 0
+        if last_rate is None:
+            # Nothing known about this trophy: hold it near zero.
+            rows.append({"id": trophy_id, "q": quantile_row(0.01, 1.0)})
+            continue
+
+        if n_target <= 0 or n_last <= 0:
+            rate = last_rate
         else:
-            count = math.exp(alpha + gamma * math.log(n_target)) if n_target > 0 else 0.0
-            # A player keeps a trophy: the count never falls below the last one.
-            if last_count is not None:
-                count = max(count, last_count)
+            # Move the last rate along the trophy's own slope, from the last
+            # page's base to the base the target is expected to have.
+            rate = last_rate * (n_target / n_last) ** beta
+            # A rarity never rises on its own.
+            rate = min(rate, last_rate)
+        rate = clamp(rate, 0.0, 100.0)
 
-        rate = 0.0 if n_target <= 0 else clamp(count / n_target * 100.0, 0.0, 100.0)
-
-        # The trophy's own uncertainty: the scatter of its own fit plus the
-        # part of the base's uncertainty that travels through gamma.
-        trophy_uncertainty = math.sqrt(resid_scatter ** 2 + (abs(gamma) * base_uncertainty) ** 2)
+        # The trophy's own uncertainty: the scatter of its fit plus the
+        # part of the base's uncertainty that travels through its slope.
+        trophy_uncertainty = math.sqrt(resid_scatter ** 2 + (abs(beta) * base_uncertainty) ** 2)
         sigma_log = math.sqrt(base_uncertainty ** 2 + trophy_uncertainty ** 2 + page_term ** 2)
 
         # On the logit scale the width grows as p approaches 1: a rate of 99.9%
